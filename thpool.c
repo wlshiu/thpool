@@ -19,10 +19,17 @@
 
 #include "jobq.h"
 
+#include "errno.h"
 //=============================================================================
 //                  Constant Definition
 //=============================================================================
+#define ENABLE_BRAKE_JOB_PUSH       0
 
+typedef enum job_state
+{
+    JOB_STATE_IDLE      = 0,
+    JOB_STATE_USED,
+} job_state_t;
 //=============================================================================
 //                  Macro Definition
 //=============================================================================
@@ -35,6 +42,9 @@ typedef struct job_box
     struct job_box  *next;
 
     thpool_job_t    job;
+
+    job_state_t     state;
+
 } job_box_t;
 
 typedef struct job_boxq
@@ -43,7 +53,8 @@ typedef struct job_boxq
     job_box_t       *pHead;              // pointer to front of queue
     job_box_t       *pTail;              // pointer to rear  of queue
     sys_sem_t       sem_has_jobs;        // flag as binary semaphore
-    int             cur_jobs;            // number of jobs in queue
+    int             job_cnt;             // number of jobs in queue
+    int             sequence_num;
 
 } job_boxq_t;
 
@@ -70,10 +81,8 @@ typedef struct thpool_dev
     sys_sem_t   sem_job_r;
     sys_sem_t   sem_job_w;
 
-    thpool_job_t    *pJob_pool;
-    //--------------
-    jobq_t      *pJobq;
-    //--------------
+    job_boxq_t          job_boxq;
+    job_box_t           *pJob_box_pool;
 
     thread_info_t       *pThread_priv_info;
 
@@ -85,51 +94,179 @@ typedef struct thpool_dev
 //=============================================================================
 //                  Private Function Definition
 //=============================================================================
+static thpool_err_t
+_job_box_create(
+    thpool_dev_t    *pDev,
+    thpool_job_t    *pJob)
+{
+    thpool_err_t    rval = THPOOL_ERR_OK;
+    job_boxq_t      *pJob_boxq = &pDev->job_boxq;
+
+    _mutex_lock(&pJob_boxq->rwmutex);
+    do {
+        int             i, sequence_num = 0, total_job_boxes = 0;
+        job_box_t       *pJob_box_pool = 0, *pJob_box_cur = 0;
+
+        sequence_num    = pJob_boxq->sequence_num;
+        total_job_boxes = pDev->total_job_boxes;
+
+        // get an empty job_box
+        if( pJob_boxq->job_cnt >= total_job_boxes )
+        {
+            log_err("%s", "job queue full !\n");
+            rval = THPOOL_ERR_QUEUE_FULL;
+            break;
+        }
+
+        sequence_num = (sequence_num >= total_job_boxes) ? 0 : sequence_num;
+
+        pJob_box_pool = pDev->pJob_box_pool;
+
+        i = 0;
+        while( i++ < total_job_boxes )
+        {
+            pJob_box_cur = pJob_box_pool + sequence_num;
+            if( pJob_box_cur->state == JOB_STATE_IDLE )
+                break;
+
+            sequence_num++;
+            sequence_num = (sequence_num == total_job_boxes) ? 0 : sequence_num;
+        }
+
+        pJob_boxq->sequence_num = sequence_num + 1;
+
+        pJob_box_cur = (i < total_job_boxes) ? pJob_box_cur : 0;
+        if( !pJob_box_cur )
+        {
+            log_err("%s", "job queue full !\n");
+            rval = THPOOL_ERR_QUEUE_FULL;
+            break;
+        }
+
+        // -----------------------
+        // assign job info
+        pJob_box_cur->next  = 0;
+        pJob_box_cur->job   = *pJob;
+        pJob_box_cur->state = JOB_STATE_USED;
+
+        //-----------------------
+        // update info to boxq
+        if( pJob_boxq->pHead )
+        {
+            pJob_boxq->pTail->next = pJob_box_cur;
+            pJob_boxq->pTail       = pJob_box_cur;
+        }
+        else
+        {
+            pJob_boxq->pHead = pJob_box_cur;
+            pJob_boxq->pTail = pJob_box_cur;
+        }
+
+        pJob_boxq->job_cnt++;
+
+    } while(0);
+
+    _mutex_unlock(&pJob_boxq->rwmutex);
+
+    return rval;
+}
+
+static thpool_err_t
+_job_box_destroy(
+    thpool_dev_t    *pDev,
+    job_box_t       **ppJob_box)
+{
+    thpool_err_t    rval = THPOOL_ERR_OK;
+    job_boxq_t      *pJob_boxq = &pDev->job_boxq;
+
+    _mutex_lock(&pJob_boxq->rwmutex);
+    do {
+        job_box_t           *pJob_box = 0;
+
+        if( !ppJob_box || !(*ppJob_box) )
+            break;
+
+        pJob_box = *ppJob_box;
+
+        memset(pJob_box, 0x0, sizeof(job_box_t));
+
+        pJob_box->state = JOB_STATE_IDLE;
+
+        *ppJob_box = 0;
+    } while(0);
+
+    _mutex_unlock(&pJob_boxq->rwmutex);
+
+    return rval;
+}
+
+static job_box_t*
+_job_box_pop(
+    thpool_dev_t    *pDev)
+{
+    job_boxq_t      *pJob_boxq = &pDev->job_boxq;
+    job_box_t       *pJob_box_act = 0;
+
+    _mutex_lock(&pJob_boxq->rwmutex);
+    do {
+        pJob_box_act = pJob_boxq->pHead;
+
+        pJob_boxq->job_cnt--;
+
+        if( pJob_boxq->pHead )
+        {
+            pJob_boxq->pHead = pJob_boxq->pHead->next;
+        }
+        else
+        {
+            pJob_boxq->pTail   = 0;
+            pJob_boxq->job_cnt = 0;
+        }
+
+    } while(0);
+
+    _mutex_unlock(&pJob_boxq->rwmutex);
+
+    return pJob_box_act;
+}
+
+
 static void*
 _thread_do(void *pArgs)
 {
     thread_info_t       *pThread_priv_info = (thread_info_t*)pArgs;
     thpool_dev_t        *pDev = (thpool_dev_t*)pThread_priv_info->pThpool_dev;
-    jobq_t              *pJobq = 0;
-    long                tid = _thread_self();
+    unsigned long       tid = _thread_self();
 
-    log_err("start tid= x%lx\n", tid);
-    pJobq = pDev->pJobq;
+    dbg("start tid= x%lx\n", tid);
 
     while( pThread_priv_info->is_exist )
     {
-        job_t   *pAct_job = 0;
+        job_box_t   *pAct_job_box = 0;
 
         _sem_wait(&pDev->sem_job_r);
 
-        _mutex_lock(&pJobq->rwmutex);
-        pAct_job = _jobq_job_pop(pDev->pJobq);
-        _mutex_unlock(&pJobq->rwmutex);
-
-        if( !pAct_job )
+        if( !(pAct_job_box = _job_box_pop(pDev)) )
             continue;
 
-        pAct_job->proc(pAct_job->pArgs);
+        pAct_job_box->job.tid = tid;
 
-//        free_job(thpool, pAct_job);
+        if( pAct_job_box->job.proc )
+            pAct_job_box->job.proc(&pAct_job_box->job);
 
+        if( pAct_job_box->job.job_delete )
+            pAct_job_box->job.job_delete(&pAct_job_box->job);
 
+        _job_box_destroy(pDev, &pAct_job_box);
 
+        #if (ENABLE_BRAKE_JOB_PUSH)
         _sem_post(&pDev->sem_job_w);
+        #endif
     }
 
-    log_err("leave tid= x%lx\n", tid);
+    dbg("leave tid= x%lx\n", tid);
     return NULL;
 }
-
-static thpool_err_t
-_job_box_new(
-    thpool_dev_t    *pDev,
-    thpool_job_t    **ppJob)
-{
-    return 0;
-}
-
 
 //=============================================================================
 //                  Public Function Definition
@@ -162,9 +299,10 @@ thpool_create(
         //----------------------
         // malloc device
         len = sizeof(thpool_dev_t) + pInit_info->thread_num * sizeof(thread_info_t) + 8;
-        len += (pInit_info->jobq_size * sizeof(thread_info_t));
+        len += (pInit_info->jobq_size * sizeof(job_box_t) + 8);
         if( !(pDev = sys_malloc(0, len)) )
         {
+            log_err("malloc fail (size= %d)\n", len);
             rval = THPOOL_ERR_ALLOCATE_FAIL;
             break;
         }
@@ -178,11 +316,10 @@ thpool_create(
         _sem_init(&pDev->sem_job_r, 0);
         _sem_init(&pDev->sem_job_w, pDev->total_threads);
 
-        // XXX: job queue model can be change.
-        _jobq_init(&pDev->pJobq);
+        // TODO: job queue model initialize
 
         // create thread
-        pDev->pThread_priv_info = (thread_info_t*)((((unsigned long)pDev + sizeof(thpool_dev_t)) + 0x7) & ~0x3);
+        pDev->pThread_priv_info = (thread_info_t*)((((unsigned long)pDev + sizeof(thpool_dev_t)) + 0x7) & ~0x7);
         for(i = 0; i < pDev->total_threads; ++i)
         {
             sys_thread_init_t   init_info = {0};
@@ -201,6 +338,12 @@ thpool_create(
 
             _thread_create(&init_info);
         }
+
+        // job_box
+        _sem_init(&pDev->job_boxq.sem_has_jobs, 0);
+        _mutex_init(&pDev->job_boxq.rwmutex);
+
+        pDev->pJob_box_pool = (job_box_t*)(((unsigned long)&pDev->pThread_priv_info[pDev->total_threads] + 0x7) & ~0x7);
 
         //----------------------
         (*ppHThpool) = (void*)pDev;
@@ -241,7 +384,6 @@ thpool_destroy(
         }
 
         // TODO: Job queue cleanup
-        _jobq_deinit(&pDev->pJobq);
 
         sys_free(pDev);
     } while(0);
@@ -258,7 +400,6 @@ thpool_job_push(
 
     do {
         thpool_dev_t    *pDev = (thpool_dev_t*)pHThpool;
-        jobq_t          *pJobq = 0;
 
         if( !pHThpool || !pJob )
         {
@@ -267,13 +408,20 @@ thpool_job_push(
             break;
         }
 
-        pJobq = pDev->pJobq;
+        #if (ENABLE_BRAKE_JOB_PUSH)
+        _sem_wait(&pDev->sem_job_w);
+        #endif
+
+        if( (rval = _job_box_create(pDev, pJob)) )
+           break;
+
+        _sem_post(&pDev->sem_job_r);
 
     } while(0);
 
     if( rval != THPOOL_ERR_OK )
     {
-        log_err("err 0x%x !", rval);
+        log_err("err 0x%x !\n", rval);
     }
 
     return rval;
@@ -291,7 +439,7 @@ thpool_tamplete(
 
     if( rval != THPOOL_ERR_OK )
     {
-        log_err("err 0x%x !", rval);
+        log_err("err 0x%x !\n", rval);
     }
 
     return rval;

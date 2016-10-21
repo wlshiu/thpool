@@ -36,6 +36,14 @@ extern "C" {
     #define STRUCTURE_POINTER(type, ptr, member)    (type*)((unsigned long)ptr - MEMBER_OFFSET(type, member))
 #endif
 
+/**
+ * handle check
+ */
+#define _verify_handle(phandle, err_code)              \
+            do{ if(phandle==NULL) {                    \
+                    return err_code;}                  \
+            }while(0)
+
 
 typedef void*   (*pf_thread_entry)(void*);
 

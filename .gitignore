@@ -21,4 +21,13 @@ Release/*
 *.layout
 bin/*
 obj/*
+*.IAB
+*.IAD
+*.IMB
+*.IMD
+*.PFI
+*.PO
+*.PR
+*.PRI
+*.PS
 

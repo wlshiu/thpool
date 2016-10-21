@@ -26,6 +26,7 @@ typedef enum thpool_err
     THPOOL_ERR_OK               = 0,
     THPOOL_ERR_ALLOCATE_FAIL,
     THPOOL_ERR_INVALID_PARAM,
+    THPOOL_ERR_QUEUE_FULL,
     THPOOL_ERR_UNKNOWN
 } thpool_err_t;
 //=============================================================================
@@ -40,10 +41,18 @@ typedef enum thpool_err
  */
 typedef struct thpool_job
 {
-    void    (*proc)(struct thpool_job_box *pJBox);
-    void    *pTunnel_info[2];
+    void    (*proc)(struct thpool_job *pJob);
 
-    void    (*job_delete)(struct thpool_job_box *pJBox);
+    union {
+        unsigned int        u32_value;
+        unsigned long long  u64_value;
+        void                *pAddr;
+    } tunnel_info[2];
+
+    void    (*job_delete)(struct thpool_job *pJob);
+
+    // debug
+    unsigned long   tid;
 } thpool_job_t;
 
 /**
@@ -86,6 +95,13 @@ thpool_err_t
 thpool_destroy(
     thpool_t    **ppHThpool,
     void        *extraData);
+
+
+thpool_err_t
+thpool_job_push(
+    thpool_t        *pHThpool,
+    thpool_job_t    *pJob);
+
 
 
 #ifdef __cplusplus

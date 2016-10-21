@@ -76,6 +76,9 @@ extern LOG_FLAG_s    gLog_flags;
                                                 pthread_mutex_unlock(&g_mutex_msg);                            \
                                             }while(0)
 
+#undef log_err
+#define log_err     dbg
+
 
 #ifdef __cplusplus
 }
